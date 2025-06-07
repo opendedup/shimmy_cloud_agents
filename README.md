@@ -61,14 +61,14 @@ poetry install
 
 4. Generate gRPC files:
 ```bash
-protoc --python_out=. --grpc_python_out=. shimmy_cloud_agents/shared_grpc/protos/shimmy_interface.proto
+python3 -m grpc_tools.protoc -I=shimmy_cloud_agents/shared_grpc/protos --experimental_allow_proto3_optional --python_out=shimmy_cloud_agents/shared_grpc --grpc_python_out=shimmy_cloud_agents/shared_grpc shimmy_cloud_agents/shared_grpc/protos/shimmy_interface.proto
 ```
 
 5. Fix the import reference in the generated files:
 After generating the gRPC files, you need to update the import statement in `shimmy_interface_pb2_grpc.py` to use relative imports:
 ```python
 # Change from:
-from shimmy_cloud_agents.shared_grpc import shimmy_interface_pb2 as shimmy__interface__pb2
+import shimmy_interface_pb2 as shimmy__interface__pb2
 # To:
 from . import shimmy_interface_pb2 as shimmy__interface__pb2
 ```

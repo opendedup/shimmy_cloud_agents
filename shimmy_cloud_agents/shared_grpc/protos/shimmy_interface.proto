@@ -16,6 +16,7 @@ message AudioChunk {
   bytes audio_data = 1; // Raw audio bytes (e.g., PCM 16-bit)
   // google.protobuf.Timestamp timestamp = 2; // Optional: Timestamp for the chunk
   int64 sequence_number = 3; // Optional: To ensure order
+  float direction = 4; // Optional: Direction of audio source in radians or degrees
 }
 
 // Represents non-audio status or data the robot might send
@@ -29,6 +30,8 @@ message RobotStatusUpdate {
     GenericRobotState generic_state = 6; // For general status like "Idle", "Charging"
     RobotError error_report = 7;
     CommandAcknowledgement command_ack = 8;
+    LocationStatus location_status = 9;
+    EnvironmentalStatus environmental_status = 10;
   }
 }
 
@@ -79,6 +82,32 @@ message RobotError {
   string error_message = 2;
 }
 
+message LocationStatus {
+  // Position
+  float x = 1;
+  float y = 2;
+  float z = 3; // Optional, might be 0 in 2D environments
+
+  // Orientation as a quaternion
+  float orientation_w = 4;
+  float orientation_x = 5;
+  float orientation_y = 6;
+  float orientation_z = 7;
+
+  // The coordinate frame this pose is in (e.g., "map", "odom")
+  string reference_frame = 8;
+}
+
+message EnvironmentalStatus {
+  string physical_address = 1; // e.g., "123 Main St, Anytown, USA"
+  string room_location = 2;    // e.g., "Living Room", "Kitchen"
+  string location_name = 3;    // e.g., "Home", "Office"
+  optional float temperature_celsius = 4;
+  optional float humidity_percent = 5;      // Relative humidity
+  optional float air_pressure_hpa = 6;      // hPa
+  optional float ambient_light_level_lux = 7;
+  optional float ambient_noise_level_db = 8;
+}
 
 // ===================================================================
 //  Messages for Cloud -> Robot Communication

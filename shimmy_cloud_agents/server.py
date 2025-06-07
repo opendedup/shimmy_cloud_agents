@@ -5,6 +5,7 @@ import logging
 import os
 import uuid
 import time
+import json
 from typing import Dict, AsyncIterable, Optional
 
 import grpc
@@ -24,6 +25,8 @@ from google.genai import types as genai_types
 
 # Import the gRPC context manager setter and resolver
 from shimmy_cloud_agents.tools.grpc_context_manager import set_active_streams, resolve_pending_power_request
+
+import traceback
 
 # --- Configuration & Logging (Your improved version) ---
 env_path = find_dotenv(".env")
@@ -89,13 +92,18 @@ active_robot_streams: Dict[str, grpc.aio.ServicerContext] = {}
 robot_audio_buffers: Dict[str, bytearray] = {}
 
 
-async def process_transcription_and_respond(
-    transcription: str, session_id: str, robot_id: str,
+async def process_audio_and_respond(
+    audio_data: bytes, session_id: str, robot_id: str,
     is_http_test: bool = False
 ) -> Optional[str]:
+    """
+    Processes audio data by sending it to the speech processor agent,
+    then uses the resulting transcription and analysis to call the main
+    subscriber agent and generate a final response.
+    """
     logger.info(
         f"Starting sequential agent processing for robot {robot_id}, session"
-        f" {session_id}. HTTP Test: {is_http_test}. Transcription: '{transcription[:100]}...'"
+        f" {session_id}. HTTP Test: {is_http_test}. Audio size: {len(audio_data)} bytes."
     )
     processing_start_time = time.time()
 
@@ -108,110 +116,128 @@ async def process_transcription_and_respond(
 
     current_session: Optional[Session] = None
     try:
-        # Try to get an existing session
-        current_session = session_service.get_session(
-            app_name=stt_subscriber_runner.app_name, user_id=robot_id, session_id=session_id
-        )
-        logger.info(f"Existing session found: {session_id} for app {stt_subscriber_runner.app_name}")
-        # Update state for existing session
-        current_session.state["latest_transcription"] = transcription
-        # Ensure grpc_context is NOT stored in ADK session state
-        current_session.state.pop("grpc_context", None) 
+        # Get or create the main session for the stt_subscriber_runner
+        try:
+            current_session = await session_service.get_session(
+                app_name=stt_subscriber_runner.app_name, user_id=robot_id, session_id=session_id
+            )
+            logger.info(f"Existing session found: {session_id} for app {stt_subscriber_runner.app_name}")
+            # Clear out old analysis results from previous turns
+            current_session.state.pop("speech_analysis_result", None)
+            current_session.state.pop("grpc_context", None)
+        except AttributeError:
+            logger.info(f"Creating new session: {session_id} for app {stt_subscriber_runner.app_name}")
+            initial_state = {"robot_id": robot_id}
+            current_session = await session_service.create_session(
+                app_name=stt_subscriber_runner.app_name,
+                user_id=robot_id,
+                session_id=session_id,
+                state=initial_state,
+            )
 
-    except AttributeError: # Session not found, create a new one
-        logger.info(f"Creating new session: {session_id} for app {stt_subscriber_runner.app_name}")
-        initial_state = {
-            "robot_id": robot_id,
-            "latest_transcription": transcription,
-            # Ensure grpc_context is NOT stored in ADK session state
-        }
-        current_session = session_service.create_session(
-            app_name=stt_subscriber_runner.app_name,
-            user_id=robot_id,
-            session_id=session_id,
-            state=initial_state,
-        )
-
-    if not current_session:
-        logger.error(f"Critical error: Failed to get or create session {session_id} for robot {robot_id}")
+    except Exception as e:
+        logger.exception(f"Critical error during session retrieval/creation for {session_id}: {e}")
         return "Error: Session management failed critically."
 
-    # Now current_session is guaranteed to be a Session object, and its state contains 'latest_transcription'
-
+    # Run the Speech Processor agent to get transcription and analysis
     speech_analysis_result = None
+    transcription = ""
     try:
-        logger.info(f"Preparing to run Speech Processor for session {session_id} (correlating with stt_subscriber session)...")
+        logger.info(f"Preparing to run Speech Processor for session {session_id}...")
 
-        # State needed by speech_processor_agent's callback
-        speech_processor_session_state = {
-            "robot_id": robot_id,
-            "latest_transcription": transcription,
-            # Ensure grpc_context is NOT stored in ADK session state for speech_processor_runner either
-        }
-        if not is_http_test and grpc_context: # Ensure grpc_context is available if needed
-             speech_processor_session_state["grpc_context"] = grpc_context
+        # Prepare audio input for the speech processor agent
+        audio_part = genai_types.Part(inline_data=genai_types.Blob(mime_type="audio/flac", data=audio_data))
+        # Per Gemini API requirements, a text part must be included.
+        # This text should be a simple instruction that doesn't conflict with the agent's main system prompt.
+        text_part = genai_types.Part(text="Process the following audio according to your instructions.")
+        speech_processor_input = genai_types.Content(role="user", parts=[text_part, audio_part])
 
-        # Ensure a session exists for speech_processor_runner with its own app_name
+        # Get or create a session for the speech_processor_runner
         try:
-            sp_session = session_service.get_session(
+            sp_session = await session_service.get_session(
                 app_name=speech_processor_runner.app_name,
                 user_id=robot_id,
                 session_id=session_id
             )
-            sp_session.state.update(speech_processor_session_state)
-            # Ensure grpc_context is NOT stored here either
-            sp_session.state.pop("grpc_context", None) 
-            logger.info(f"Updated existing session {session_id} for speech_processor_runner (app: {speech_processor_runner.app_name}).")
-        except AttributeError: # Not found, create one for speech_processor_runner
-            sp_session = session_service.create_session(
+            sp_session.state.clear() # Clear state for a fresh run
+            sp_session.state["robot_id"] = robot_id
+            logger.info(f"Cleared and updated existing session {session_id} for {speech_processor_runner.app_name}.")
+        except AttributeError:
+            sp_session = await session_service.create_session(
                 app_name=speech_processor_runner.app_name,
                 user_id=robot_id,
                 session_id=session_id,
-                state=speech_processor_session_state
+                state={"robot_id": robot_id}
             )
-            logger.info(f"Created new session {session_id} for speech_processor_runner (app: {speech_processor_runner.app_name}).")
+            logger.info(f"Created new session {session_id} for {speech_processor_runner.app_name}.")
 
         logger.info(f"Running Speech Processor (app: {speech_processor_runner.app_name}) for session {sp_session.id}...")
+        
+        raw_model_output = None
         async for event in speech_processor_runner.run_async(
-            session_id=sp_session.id, user_id=robot_id, new_message=None # Callback loads from sp_session.state
+            session_id=sp_session.id, user_id=robot_id, new_message=speech_processor_input
         ):
             logger.debug(f"Speech Processor Event for {sp_session.id}: {event.author}")
-            # speech_analysis_result is expected to be put into sp_session.state by the speech_processor_agent
-        
-        if "speech_analysis_result" in sp_session.state:
-            speech_analysis_result = sp_session.state["speech_analysis_result"]
-            current_session.state["speech_analysis_result"] = speech_analysis_result # Copy to main session state
-            logger.info(f"Speech analysis complete for {sp_session.id}: {speech_analysis_result}. Copied to main session.")
-        else:
-            logger.warning(f"Speech processor did not populate 'speech_analysis_result' in state for {sp_session.id} (app: {speech_processor_runner.app_name})")
-            current_session.state.pop("speech_analysis_result", None) # Ensure it's not stale in main session
-
-    except Exception as e:
-        logger.exception(f"Error during Speech Processor run for session {session_id} (attempted for app {speech_processor_runner.app_name}): {e}")
-        current_session.state.pop("speech_analysis_result", None) # Ensure it's not stale in main session state
-
-    final_response_text = "Sorry, I couldn't process that request."
-    try:
-        logger.info(f"Running STT Subscriber Agent for session {current_session.id}...")
-        user_content = genai_types.Content(
-            role="user", parts=[genai_types.Part(text=transcription)]
-        )
-        async for event in stt_subscriber_runner.run_async(
-            session_id=current_session.id, user_id=robot_id, new_message=user_content
-        ):
-            logger.debug(f"STT Subscriber Event for {current_session.id}: {event.author}")
             if event.is_final_response and event.content and event.content.parts:
-                response_parts = [
-                    part.text
-                    for part in event.content.parts
-                    if hasattr(part, "text") and part.text
-                ]
-                if response_parts:
-                   final_response_text = " ".join(response_parts)
-                   logger.info(f"STT Subscriber final response for {current_session.id}: {final_response_text}")
+                raw_model_output = event.content.parts[0].text
+                logger.info(f"Raw output from speech_processor_agent: {raw_model_output}")
+                # Manually place the raw output into the state for consistency if needed elsewhere
+                sp_session.state["speech_analysis_result"] = raw_model_output
+                break # Exit after getting the final response
+
+        # Extract the analysis and the transcription from the result
+        if raw_model_output:
+            try:
+                # The output should be a JSON string, let's parse it.
+                analysis_data = json.loads(raw_model_output)
+                speech_analysis_result = analysis_data
+                current_session.state["speech_analysis_result"] = speech_analysis_result  # Copy to main session
+                if isinstance(speech_analysis_result, dict) and "original_text" in speech_analysis_result:
+                    transcription = speech_analysis_result["original_text"]
+                    logger.info(f"Successfully parsed speech analysis for {sp_session.id}. Transcription: '{transcription[:100]}...'")
+                else:
+                    logger.error(f"Parsed JSON for {sp_session.id} is malformed or missing 'original_text'.")
+                    transcription = "Error: Could not extract transcription from parsed JSON."
+            except json.JSONDecodeError:
+                # If it's not JSON, it's likely just the transcription.
+                logger.warning(f"Speech processor output for {sp_session.id} was not valid JSON. Treating as plain transcription.")
+                transcription = raw_model_output
+                # We still have the transcription, but no analysis. Clear the analysis result.
+                current_session.state.pop("speech_analysis_result", None)
+        else:
+            logger.warning(f"Speech processor did not return any output for session {sp_session.id}")
+            transcription = "Error: Speech analysis returned no output."
+
     except Exception as e:
-        logger.exception(f"Error during STT Subscriber run for session {current_session.id}: {e}")
-        final_response_text = f"An error occurred during main processing: {e}"
+        logger.exception(f"Error during Speech Processor run for session {session_id}: {e}")
+        transcription = f"Error during speech processing: {e}"
+
+    # Now, run the STT Subscriber agent with the real transcription
+    final_response_text = "Sorry, I couldn't process that request."
+    if not transcription.startswith("Error:"):
+        try:
+            logger.info(f"Running STT Subscriber Agent for session {current_session.id} with new transcription...")
+            user_content = genai_types.Content(
+                role="user", parts=[genai_types.Part(text=transcription)]
+            )
+            async for event in stt_subscriber_runner.run_async(
+                session_id=current_session.id, user_id=robot_id, new_message=user_content
+            ):
+                logger.debug(f"STT Subscriber Event for {current_session.id}: {event.author}")
+                if event.is_final_response and event.content and event.content.parts:
+                    response_parts = [
+                        part.text
+                        for part in event.content.parts
+                        if hasattr(part, "text") and part.text
+                    ]
+                    if response_parts:
+                       final_response_text = " ".join(response_parts)
+                       logger.info(f"STT Subscriber final response for {current_session.id}: {final_response_text}")
+        except Exception as e:
+            logger.exception(f"Error during STT Subscriber run for session {current_session.id}: {e}")
+            final_response_text = f"An error occurred during main processing: {e}"
+    else:
+        final_response_text = transcription # Pass the error message back to the user
 
     processing_end_time = time.time()
     logger.info(
@@ -279,19 +305,18 @@ class ShimmyCloudServiceServicer(
                 current_process_session_id = client_msg_session_id or session_id_for_this_connection
 
                 if client_msg_payload_type == "audio_chunk":
-                    robot_audio_buffers[robot_id].extend(message.audio_chunk.audio_data)
-                    BUFFER_THRESHOLD = 16000 * 2 # Example threshold
-                    logger.debug(f"[{robot_id}] Communicate: Audio chunk received. Buffer size: {len(robot_audio_buffers[robot_id])}")
-                    if len(robot_audio_buffers[robot_id]) >= BUFFER_THRESHOLD:
+                    audio_chunk_data = message.audio_chunk.audio_data
+                    audio_chunk_direction = message.audio_chunk.direction # Get direction
+                    robot_audio_buffers[robot_id].extend(audio_chunk_data)
+                    logger.debug(f"[{robot_id}] Communicate: Audio chunk received. Buffer size: {len(robot_audio_buffers[robot_id])}, Direction: {audio_chunk_direction:.2f}") # Log direction
+                    if len(robot_audio_buffers[robot_id]) > 0: # Process if there is any audio
                         audio_data = bytes(robot_audio_buffers[robot_id])
                         robot_audio_buffers[robot_id] = bytearray() # Clear buffer
-                        logger.info(f"[{robot_id}] Communicate: Audio buffer threshold reached. Processing {len(audio_data)} bytes.")
-                        # Simulate STT and further processing
-                        transcription = f"Simulated transcription for {robot_id} at {time.time()} from audio chunk"
-                        logger.info(f"[{robot_id}] Communicate: STT Result from audio: {transcription}. Creating task for process_transcription_and_respond.")
+                        logger.info(f"[{robot_id}] Communicate: Processing {len(audio_data)} bytes of audio.")
+                        # Call the new audio processing function
                         asyncio.create_task(
-                            process_transcription_and_respond(
-                                transcription, current_process_session_id, robot_id, is_http_test=False
+                            process_audio_and_respond(
+                                audio_data, current_process_session_id, robot_id, is_http_test=False
                             )
                         )
                 elif client_msg_payload_type == "status_update":
@@ -312,12 +337,16 @@ class ShimmyCloudServiceServicer(
                             # The ack has been consumed by the power status request, no further processing for this specific ack here.
                         elif command_ack.command_id == "interactive_shell_command":
                             interactive_text = command_ack.message
-                            logger.info(f"[{robot_id}] Communicate: Interactive shell command RECEIVED: '{interactive_text}'. Creating task for process_transcription_and_respond.")
-                            asyncio.create_task(
-                                process_transcription_and_respond(
-                                    interactive_text, current_process_session_id, robot_id, is_http_test=False
-                                )
+                            logger.info(f"[{robot_id}] Communicate: Interactive shell command RECEIVED: '{interactive_text}'. This should be handled via audio input now.")
+                            # The old text-based path is deprecated in favor of audio.
+                            # You might want to send a text response back to the user indicating this.
+                            response_message = shimmy_interface_pb2.CloudToRobotMessage(
+                                session_id=current_process_session_id,
+                                text_response=shimmy_interface_pb2.TextResponse(
+                                    text_to_speak="Please use voice commands instead of the interactive text shell."
+                                ),
                             )
+                            await context.write(response_message)
                         # else: regular command acknowledgement, just log (already done by general log above)
                     # else: other status update types, just log (already done by general log above)
 
@@ -394,30 +423,19 @@ class AgentTestRequest(BaseModel):
 # --- HTTP Endpoint for Testing Agents ---
 @app.post("/test_agent") # Removed response_model=str for more flexibility
 async def test_agent_endpoint(request: AgentTestRequest):
+    # This endpoint is now difficult to use as it's text-based.
+    # It would need to be updated to accept an audio file to be fully functional.
+    # For now, it will likely fail or produce unintended results.
+    logger.warning("/test_agent endpoint is designed for text and may not work with the new audio pipeline.")
     session_id = request.session_id or f"http_session_{uuid.uuid4().hex[:8]}"
     logger.info(
         f"Received /test_agent request: transcription='{request.transcription}',"
         f" robot_id='{request.robot_id}', session_id='{session_id}'"
     )
-    try:
-        final_response = await process_transcription_and_respond(
-            transcription=request.transcription,
-            session_id=session_id,
-            robot_id=request.robot_id,
-            is_http_test=True,
-        )
-        if final_response is None:
-            error_detail = "Agent processing failed to return text."
-            logger.error(f"{error_detail} for session {session_id} via HTTP.")
-            raise HTTPException(status_code=500, detail={"error": error_detail, "session_id": session_id})
-        return {"response": final_response, "session_id": session_id}
-    except HTTPException as http_exc:
-        # Re-raise HTTPException to let FastAPI handle it, assuming detail might already include session_id or is structured.
-        raise http_exc
-    except Exception as e:
-        error_detail = str(e)
-        logger.exception(f"Error processing /test_agent request for session {session_id}: {e}")
-        raise HTTPException(status_code=500, detail={"error": error_detail, "session_id": session_id})
+    # This call is incorrect now, as process_audio_and_respond expects bytes.
+    # To make this work, you would need to load a sample audio file or change the endpoint.
+    # Returning a static message to avoid crashes.
+    return {"response": "This endpoint is deprecated for the audio pipeline. Please test via gRPC.", "session_id": session_id}
 
 
 # --- Main Execution ---

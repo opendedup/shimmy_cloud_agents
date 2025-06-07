@@ -278,51 +278,6 @@ async def get_power_status_tool(tool_context: ToolContext = None) -> str:
         return f"Error sending power status request (ID: {command_id}): {e_send}"
 
 
-async def get_current_time_tool(
-    time_zone: str = "UTC", tool_context: ToolContext = None
-) -> str:
-    """Requests the current time from the robot (optionally for a timezone)."""
-    logger.info(f"get_current_time_tool called for timezone: {time_zone}")
-    invocation_ctx = getattr(tool_context, "_invocation_context", None)
-    if not invocation_ctx:
-        logger.error("get_current_time_tool: ToolContext._invocation_context is missing.")
-        return "Error: Invocation context missing, cannot execute time command."
-
-    robot_id_for_context = getattr(invocation_ctx, "user_id", None)
-    current_session_id = getattr(invocation_ctx.session, "id", None)
-
-    if not robot_id_for_context or not current_session_id:
-        logger.error("get_current_time_tool: Robot ID or Session ID missing from invocation context.")
-        return "Error: Robot/Session ID missing, cannot execute time command."
-
-    grpc_context = _get_grpc_context(tool_context)
-    if not grpc_context or shimmy_interface_pb2 is None:
-        return "Error: Cannot send command (gRPC context or protobuf missing)."
-
-    command_id = f"cmd_sysinfo_time_{uuid.uuid4().hex[:8]}"
-    command_payload = shimmy_interface_pb2.SystemInfoCommand(
-        info_request=shimmy_interface_pb2.SystemInfoCommand.InfoRequest.GET_CURRENT_TIME,
-        time_zone=time_zone,
-    )
-    robot_command_message = shimmy_interface_pb2.RobotCommand(
-        command_id=command_id,
-        system_info_command=command_payload
-    )
-    cloud_message = shimmy_interface_pb2.CloudToRobotMessage(
-        session_id=current_session_id,
-        robot_command=robot_command_message
-    )
-
-    logger.info(f"Prepared SystemInfoCommand (Time): {robot_command_message} for session {current_session_id} (Robot: {robot_id_for_context})")
-    try:
-        await grpc_context.write(cloud_message)
-        logger.info(f"SystemInfoCommand (Time) sent successfully to robot {robot_id_for_context} (CmdID: {command_id}).")
-        return f"Current time request (ID: {command_id}) for {time_zone} sent. Robot will provide time if configured."
-    except Exception as e:
-        logger.error(f"Failed to send SystemInfoCommand (Time) to robot {robot_id_for_context} (CmdID: {command_id}): {e}")
-        return f"Error sending current time request (ID: {command_id}): {e}"
-
-
 async def set_voice_volume_tool(
     volume_level: float, tool_context: ToolContext = None
 ) -> str:

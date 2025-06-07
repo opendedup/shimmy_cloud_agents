@@ -18,10 +18,6 @@ class SpeechAnalysisResult(BaseModel):
         default=False,
         description="True if the speech appears to be directed specifically at the robot ('Shimmy')."
     )
-    confidence: float = Field(
-        default=0.8, # Default confidence
-        description="Confidence score (0.0-1.0) of the analysis, especially the 'is_directed_at_robot' determination."
-    )
     summary: Optional[str] = Field(
         default=None,
         description="A brief one-sentence summary of the user's intent or statement."

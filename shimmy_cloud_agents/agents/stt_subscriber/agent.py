@@ -4,6 +4,7 @@ import logging
 import os
 from typing import List
 import uuid # Added for unique session IDs
+import json # For parsing datetime agent result
 
 from google.adk.agents import Agent as LlmAgent # Alias LlmAgent as Agent for clarity
 from google.adk.tools import BaseTool, FunctionTool, ToolContext # Added ToolContext
@@ -16,6 +17,8 @@ from google.genai import types # Added
 from shimmy_cloud_agents.tools import robot_commands
 # Import the new search agent
 from shimmy_cloud_agents.agents.search_agent.agent import search_llm_agent
+# Import the datetime tool directly
+from shimmy_cloud_agents.tools.datetime_tool import get_current_datetime
 
 # Import the speech processor agent if you want to call it explicitly as a tool/sub-agent
 # from shimmy_cloud_agents.agents.speech_processor.agent import speech_processor_agent
@@ -33,6 +36,27 @@ search_runner = Runner(
     app_name=SEARCH_APP_NAME,
     session_service=search_session_service
 )
+
+
+async def get_current_datetime_tool(timezone_str: str) -> str:
+    """
+    Gets the current date and time for a given timezone.
+    Args:
+        timezone_str: The timezone to get the time for (e.g., 'UTC', 'America/New_York').
+    """
+    logger.info(f"get_current_datetime_tool called for timezone: '{timezone_str}'")
+    try:
+        dt_result = get_current_datetime(timezone_str=timezone_str)
+        # Format a user-friendly response string
+        response_text = (
+            f"The current time in {dt_result['timezone']} is {dt_result['time']} "
+            f"on {dt_result['day_of_week']}, {dt_result['date']}."
+        )
+        return response_text
+    except Exception as e:
+        logger.exception(f"Exception while running get_current_datetime_tool: {str(e)}")
+        return f"An unexpected error occurred while getting the date and time: {e}"
+
 
 async def perform_search_via_agent_tool(search_query: str, tool_context: ToolContext) -> str:
     """
@@ -115,6 +139,7 @@ async def perform_search_via_agent_tool(search_query: str, tool_context: ToolCon
 
 # Wrap the async function with FunctionTool
 search_agent_function_tool = FunctionTool(func=perform_search_via_agent_tool)
+datetime_function_tool = FunctionTool(func=get_current_datetime_tool)
 
 
 # --- Define Tools ---
@@ -125,7 +150,7 @@ shimmy_tools: List[BaseTool] = [
     FunctionTool(func=robot_commands.set_led_tool),
     FunctionTool(func=robot_commands.capture_image_tool),
     FunctionTool(func=robot_commands.get_power_status_tool),
-    FunctionTool(func=robot_commands.get_current_time_tool),
+    datetime_function_tool, # Add the new datetime tool
     FunctionTool(func=robot_commands.set_voice_volume_tool),
     FunctionTool(func=robot_commands.find_object_tool),
     FunctionTool(func=robot_commands.cancel_movement_tool),
@@ -172,7 +197,7 @@ Your goal is to understand user requests based on transcribed speech and respond
 *   `set_led`: Controls the robot's LEDs. Requires `color_hex`, `brightness`, or `pattern`.
 *   `capture_image`: Takes a picture using the robot's camera.
 *   `get_power_status`: Reports the robot's battery level.
-*   `get_current_time`: Gets the current time (requires `time_zone`).
+*   `get_current_datetime_tool`: Gets the current date and time. Requires a `timezone_str` (e.g., 'UTC', 'America/Los_Angeles').
 *   `set_voice_volume`: Adjusts the robot's speaker volume. Requires `volume_level`.
 *   `find_object`: Locates a specific object visually. Requires `object_name`.
 *   `cancel_movement`: Stops any current movement.
